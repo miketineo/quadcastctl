@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rusb::{Device, DeviceHandle, GlobalContext};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -132,6 +133,16 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum PresetCmd {
+    /// List built-in and user-defined presets.
+    List,
+    /// Add or override a preset.
+    Add { name: String, color: String },
+    /// Remove a user preset (built-ins cannot be removed, only overridden).
+    Remove { name: String },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// List connected HyperX microphones.
     List,
@@ -146,6 +157,16 @@ enum Cmd {
         color: String,
         #[arg(short, long, default_value_t = 100)]
         brightness: u8,
+    },
+    /// Open the macOS system color picker; chosen color becomes the new setting.
+    Pick {
+        #[arg(short, long, default_value_t = 100)]
+        brightness: u8,
+    },
+    /// Manage named color presets.
+    Preset {
+        #[command(subcommand)]
+        action: PresetCmd,
     },
     /// Print the current config file contents.
     Show,
@@ -163,6 +184,71 @@ enum Cmd {
     Restart,
     /// Show launchd job status.
     Status,
+}
+
+const BUILTIN_PRESETS: &[(&str, &str)] = &[
+    ("red", "ff0000"),
+    ("orange", "ff9a33"),
+    ("yellow", "ffff00"),
+    ("green", "00ff00"),
+    ("cyan", "00ffff"),
+    ("blue", "0000ff"),
+    ("purple", "9933ff"),
+    ("magenta", "ff00ff"),
+    ("pink", "ff69b4"),
+    ("white", "ffffff"),
+    ("off", "000000"),
+    ("hivenet", "ff9a33"),
+];
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct UserPresets {
+    #[serde(default)]
+    presets: BTreeMap<String, String>,
+}
+
+fn presets_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("presets.toml"))
+}
+
+fn load_user_presets() -> UserPresets {
+    let path = match presets_path() {
+        Ok(p) => p,
+        Err(_) => return UserPresets::default(),
+    };
+    if !path.exists() {
+        return UserPresets::default();
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_user_presets(p: &UserPresets) -> Result<()> {
+    let dir = config_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = presets_path()?;
+    fs::write(&path, toml::to_string_pretty(p)?)?;
+    Ok(())
+}
+
+fn resolve_color_or_preset(input: &str) -> Result<String> {
+    if Color::from_hex(input).is_ok() {
+        return Ok(input.strip_prefix('#').unwrap_or(input).to_string());
+    }
+    let user = load_user_presets();
+    if let Some(hex) = user.presets.get(input) {
+        return Ok(hex.clone());
+    }
+    for (name, hex) in BUILTIN_PRESETS {
+        if *name == input {
+            return Ok((*hex).to_string());
+        }
+    }
+    bail!(
+        "{input:?} is not a valid hex color or known preset. Try `quadcastctl preset list`."
+    )
 }
 
 fn config_dir() -> Result<PathBuf> {
@@ -307,8 +393,9 @@ fn cmd_list() -> Result<()> {
 }
 
 fn cmd_solid(color: &str, brightness: u8) -> Result<()> {
+    let hex = resolve_color_or_preset(color)?;
     let cfg = Config {
-        color: color.to_string(),
+        color: hex,
         brightness,
     };
     let color = cfg.resolved()?;
@@ -329,9 +416,71 @@ fn cmd_solid(color: &str, brightness: u8) -> Result<()> {
     Ok(())
 }
 
-fn cmd_set(color: &str, brightness: u8) -> Result<()> {
+fn pick_color_macos() -> Result<Color> {
+    // AppleScript's `choose color` returns {R, G, B} in the 0..65535 range.
+    // We capture stdout, parse the three integers, and downscale to u8.
+    let script = r#"
+        try
+            set c to choose color
+            set r to item 1 of c
+            set g to item 2 of c
+            set b to item 3 of c
+            return (r as text) & "," & (g as text) & "," & (b as text)
+        on error number -128
+            return "CANCELLED"
+        end try
+    "#;
+    let out = Command::new("osascript")
+        .args(["-e", script])
+        .output()
+        .context("running osascript (macOS only)")?;
+    if !out.status.success() {
+        bail!(
+            "osascript failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s == "CANCELLED" {
+        bail!("color picker cancelled");
+    }
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 {
+        bail!("unexpected osascript output: {s:?}");
+    }
+    let parse = |p: &str| -> Result<u8> {
+        let n: u32 = p.trim().parse().context("parsing color component")?;
+        // AppleScript color range is 0..65535; map to 0..255.
+        Ok((n / 257).min(255) as u8)
+    };
+    Ok(Color {
+        r: parse(parts[0])?,
+        g: parse(parts[1])?,
+        b: parse(parts[2])?,
+    })
+}
+
+fn cmd_pick(brightness: u8) -> Result<()> {
+    if brightness > 100 {
+        bail!("brightness must be 0-100");
+    }
+    let color = pick_color_macos()?;
+    let hex = format!("{:02x}{:02x}{:02x}", color.r, color.g, color.b);
     let cfg = Config {
-        color: color.to_string(),
+        color: hex.clone(),
+        brightness,
+    };
+    save_config(&cfg)?;
+    println!(
+        "picked #{hex} (brightness {brightness}) — daemon picks up within ~1s"
+    );
+    Ok(())
+}
+
+fn cmd_set(color: &str, brightness: u8) -> Result<()> {
+    let hex = resolve_color_or_preset(color)?;
+    let cfg = Config {
+        color: hex,
         brightness,
     };
     cfg.resolved()?; // validate before saving
@@ -342,6 +491,51 @@ fn cmd_set(color: &str, brightness: u8) -> Result<()> {
         cfg.color,
         cfg.brightness
     );
+    Ok(())
+}
+
+fn cmd_preset_list() -> Result<()> {
+    let user = load_user_presets();
+    println!("Built-in:");
+    for (name, hex) in BUILTIN_PRESETS {
+        let overridden = user.presets.contains_key(*name);
+        if overridden {
+            println!("  {name:10} {hex}  (overridden by user)");
+        } else {
+            println!("  {name:10} {hex}");
+        }
+    }
+    if !user.presets.is_empty() {
+        println!("\nUser:");
+        for (name, hex) in &user.presets {
+            println!("  {name:10} {hex}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_preset_add(name: &str, color: &str) -> Result<()> {
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        bail!("preset name must be non-empty and contain no whitespace");
+    }
+    let hex = resolve_color_or_preset(color)?;
+    let mut user = load_user_presets();
+    user.presets.insert(name.to_string(), hex.clone());
+    save_user_presets(&user)?;
+    println!("added preset {name} = {hex}");
+    Ok(())
+}
+
+fn cmd_preset_remove(name: &str) -> Result<()> {
+    let mut user = load_user_presets();
+    if user.presets.remove(name).is_some() {
+        save_user_presets(&user)?;
+        println!("removed user preset {name}");
+    } else if BUILTIN_PRESETS.iter().any(|(n, _)| *n == name) {
+        bail!("{name:?} is a built-in preset; built-ins cannot be removed (override with `preset add`)");
+    } else {
+        bail!("no preset named {name:?}");
+    }
     Ok(())
 }
 
@@ -553,6 +747,12 @@ fn main() -> Result<()> {
         Cmd::List => cmd_list(),
         Cmd::Solid { color, brightness } => cmd_solid(&color, brightness),
         Cmd::Set { color, brightness } => cmd_set(&color, brightness),
+        Cmd::Pick { brightness } => cmd_pick(brightness),
+        Cmd::Preset { action } => match action {
+            PresetCmd::List => cmd_preset_list(),
+            PresetCmd::Add { name, color } => cmd_preset_add(&name, &color),
+            PresetCmd::Remove { name } => cmd_preset_remove(&name),
+        },
         Cmd::Show => cmd_show(),
         Cmd::Daemon => cmd_daemon(),
         Cmd::Install => cmd_install(),
