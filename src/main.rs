@@ -242,10 +242,23 @@ struct Config {
     speed: u8,
     #[serde(default = "default_delay")]
     delay: u8,
-    /// When set, the daemon switches to this color/preset whenever the system
-    /// reports the input device as muted (hardware tap, Control Center, app, etc.).
+    /// When set, the daemon switches to this color/preset whenever macOS reports
+    /// the input device as muted at the system level — Control Center mute,
+    /// `quadcastctl mute`, app-level mute, or push-to-talk hotkeys.
+    /// NOTE: the QuadCast's hardware tap-to-mute does NOT propagate to macOS;
+    /// it cuts the audio inside the mic firmware without telling the OS, so
+    /// `on_mute` will not trigger from a hardware tap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     on_mute: Option<String>,
+    /// When true, the daemon syncs Quadcast mute transitions into any open
+    /// Google Meet tab in Chrome by toggling Meet's in-call mic button.
+    /// Requires Chrome's "Allow JavaScript from Apple Events" (View > Developer).
+    #[serde(default, skip_serializing_if = "is_false")]
+    meet_sync: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn default_brightness() -> u8 {
@@ -268,6 +281,7 @@ impl Default for Config {
             speed: 81,
             delay: 10,
             on_mute: None,
+            meet_sync: false,
         }
     }
 }
@@ -546,9 +560,12 @@ fn send_control_packet(handle: &DeviceHandle<GlobalContext>, packet: &[u8]) -> R
 // --- Core Audio FFI ---------------------------------------------------------
 //
 // We ask the macOS Audio HAL whether the default input device is muted.
-// macOS forwards the Quadcast S's hardware tap-to-mute to this property,
-// AND it captures software mutes (Control Center, app-driven mute, etc).
-// One signal covers everything we care about.
+// This catches system-level mutes (Control Center, `quadcastctl mute`,
+// app-driven mute, push-to-talk hotkeys). The QuadCast's hardware tap-to-mute
+// is invisible to macOS — the firmware cuts the audio internally without
+// flipping any Core Audio property and without emitting any HID event we
+// could capture (verified empirically against the device's HID descriptor).
+// So `on_mute` and `meet_sync` only trigger on system-level transitions.
 
 mod core_audio {
     use std::os::raw::c_void;
@@ -574,6 +591,15 @@ mod core_audio {
     pub const SELECTOR_NAME: AudioObjectPropertySelector = fcc(b"lnam");
     pub const SELECTOR_DEVICES: AudioObjectPropertySelector = fcc(b"dev#");
     pub const SELECTOR_STREAMS: AudioObjectPropertySelector = fcc(b"stm#");
+    /// kAudioObjectPropertyClass — the class of an audio object (control, stream, …).
+    pub const SELECTOR_CLASS: AudioObjectPropertySelector = fcc(b"clas");
+    /// kAudioObjectPropertyOwnedObjects — children (controls, streams) of a device.
+    pub const SELECTOR_OWNED: AudioObjectPropertySelector = fcc(b"ownd");
+    /// kAudioControlPropertyScope / Element / Variant — the scope/element a control governs.
+    pub const SELECTOR_CONTROL_SCOPE: AudioObjectPropertySelector = fcc(b"cscp");
+    pub const SELECTOR_CONTROL_ELEMENT: AudioObjectPropertySelector = fcc(b"celm");
+    /// kAudioBooleanControlPropertyValue — value of a boolean control (mute, solo, …).
+    pub const SELECTOR_BOOL_CONTROL_VALUE: AudioObjectPropertySelector = fcc(b"bcvl");
 
     #[repr(C)]
     pub struct AudioObjectPropertyAddress {
@@ -769,6 +795,156 @@ fn ca_read_input_mute(device: u32) -> Result<Option<bool>> {
     Ok(Some(value != 0))
 }
 
+/// Render a FourCharCode back to its 4-byte ASCII (or hex if non-printable).
+fn fcc_to_str(code: u32) -> String {
+    let bytes = [
+        ((code >> 24) & 0xff) as u8,
+        ((code >> 16) & 0xff) as u8,
+        ((code >> 8) & 0xff) as u8,
+        (code & 0xff) as u8,
+    ];
+    if bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        format!("0x{code:08x}")
+    }
+}
+
+fn ca_get_u32(object: u32, selector: u32, scope: u32) -> Option<u32> {
+    use core_audio::*;
+    let addr = AudioObjectPropertyAddress {
+        selector,
+        scope,
+        element: ELEMENT_MAIN,
+    };
+    if !unsafe { AudioObjectHasProperty(object, &addr) } {
+        return None;
+    }
+    let mut value: u32 = 0;
+    let mut size: u32 = 4;
+    let st = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut value as *mut u32 as *mut std::ffi::c_void,
+        )
+    };
+    if st != 0 {
+        return None;
+    }
+    Some(value)
+}
+
+fn ca_owned_objects(object: u32, scope: u32) -> Vec<u32> {
+    use core_audio::*;
+    let addr = AudioObjectPropertyAddress {
+        selector: SELECTOR_OWNED,
+        scope,
+        element: ELEMENT_MAIN,
+    };
+    let mut size: u32 = 0;
+    let st = unsafe {
+        AudioObjectGetPropertyDataSize(object, &addr, 0, std::ptr::null(), &mut size)
+    };
+    if st != 0 || size == 0 {
+        return Vec::new();
+    }
+    let count = (size / 4) as usize;
+    let mut ids = vec![0u32; count];
+    let st = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            ids.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    if st != 0 {
+        return Vec::new();
+    }
+    ids
+}
+
+/// Walk every child object of the QuadCast and print class/scope/element/value.
+/// Run twice — once with the mic tapped (LED red), once unmuted — and diff
+/// to find a property that tracks the hardware mute.
+fn cmd_audio_debug() -> Result<()> {
+    use core_audio::*;
+    let (id, name) = ca_find_quadcast_device()?
+        .ok_or_else(|| anyhow!("no Quadcast device found in Core Audio"))?;
+    println!("device: {name} (id={id})");
+
+    // Try each scope. Hardware mute likely lives in input scope, but we cast
+    // a wide net so we don't miss a per-stream or global control.
+    let scopes: &[(u32, &str)] = &[(SCOPE_GLOBAL, "global"), (SCOPE_INPUT, "input")];
+
+    for (scope, scope_name) in scopes {
+        let owned = ca_owned_objects(id, *scope);
+        if owned.is_empty() {
+            continue;
+        }
+        println!("\n  scope={scope_name}: {} owned objects", owned.len());
+        for child in owned {
+            let class = ca_get_u32(child, SELECTOR_CLASS, SCOPE_GLOBAL)
+                .map(fcc_to_str)
+                .unwrap_or_else(|| "?".into());
+            let ctl_scope = ca_get_u32(child, SELECTOR_CONTROL_SCOPE, SCOPE_GLOBAL)
+                .map(fcc_to_str)
+                .unwrap_or_else(|| "-".into());
+            let ctl_elem = ca_get_u32(child, SELECTOR_CONTROL_ELEMENT, SCOPE_GLOBAL)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into());
+            let bval = ca_get_u32(child, SELECTOR_BOOL_CONTROL_VALUE, SCOPE_GLOBAL);
+            let mute_global = ca_get_u32(child, SELECTOR_MUTE, SCOPE_GLOBAL);
+            let mute_input = ca_get_u32(child, SELECTOR_MUTE, SCOPE_INPUT);
+            print!(
+                "    [{child:>4}] class={class} ctl_scope={ctl_scope} ctl_elem={ctl_elem}"
+            );
+            if let Some(v) = bval {
+                print!(" bool={v}");
+            }
+            if let Some(v) = mute_global {
+                print!(" mute(g)={v}");
+            }
+            if let Some(v) = mute_input {
+                print!(" mute(i)={v}");
+            }
+            println!();
+        }
+    }
+
+    // Also probe the device itself across a battery of likely selectors.
+    println!("\n  device-level probes:");
+    let probes: &[(u32, &str, u32)] = &[
+        (SELECTOR_MUTE, "mute", SCOPE_GLOBAL),
+        (SELECTOR_MUTE, "mute", SCOPE_INPUT),
+        (fcc(b"jack"), "jack", SCOPE_INPUT),
+        (fcc(b"vmut"), "vmut", SCOPE_INPUT),
+        (fcc(b"solo"), "solo", SCOPE_INPUT),
+        (fcc(b"talb"), "talb", SCOPE_INPUT),
+    ];
+    for (sel, name_, scope) in probes {
+        let scope_name = if *scope == SCOPE_GLOBAL { "g" } else { "i" };
+        match ca_get_u32(id, *sel, *scope) {
+            Some(v) => println!("    {name_}({scope_name}) = {v}"),
+            None => println!("    {name_}({scope_name}) = (absent)"),
+        }
+    }
+
+    println!("\n  → run this once tapped (mic LED red), once unmuted, diff the output.");
+    Ok(())
+}
+
+// Local fcc helper for cmd_audio_debug's inline probes.
+const fn fcc(s: &[u8; 4]) -> u32 {
+    ((s[0] as u32) << 24) | ((s[1] as u32) << 16) | ((s[2] as u32) << 8) | (s[3] as u32)
+}
+
 fn ca_set_input_mute(device: u32, muted: bool) -> Result<()> {
     use core_audio::*;
     let addr = AudioObjectPropertyAddress {
@@ -881,7 +1057,7 @@ fn cmd_audio_state() -> Result<()> {
     };
 
     println!(
-        "\nWatching {qname} (id={qid}) every 200ms. Tap the mute button on the mic, or mute via macOS Control Center, or mute in a call app."
+        "\nWatching {qname} (id={qid}) every 200ms. Mute via macOS Control Center, `quadcastctl mute`, or in a call app — the mic's hardware tap-to-mute is invisible to macOS and won't show up here."
     );
     println!("Ctrl-C to stop.\n");
     let running = install_signal_handler()?;
@@ -996,12 +1172,24 @@ enum Cmd {
     /// Show launchd job status.
     Status,
     /// Probe macOS Core Audio for the input device's mute state.
-    /// Useful to verify the hardware tap-to-mute is reflected in the system.
+    /// Reflects system-level mute only — the QuadCast hardware tap is
+    /// invisible to macOS.
     AudioState,
+    /// Diagnostic — enumerate every Core Audio child object/control of the
+    /// Quadcast and print class/scope/value. Run twice (tapped vs untapped)
+    /// and diff to locate any property that tracks the hardware tap.
+    AudioDebug,
     /// Set, clear, or show the color/preset shown when the mic is muted.
     /// Examples: `mute-color red`, `mute-color none`, `mute-color`.
     MuteColor {
         /// A color, preset, or `none` to disable mute-override. Omit to print current value.
+        value: Option<String>,
+    },
+    /// Toggle / show Google Meet sync. When on, the daemon clicks Meet's
+    /// in-call mic button on every Quadcast mute transition.
+    /// Examples: `meet-sync on`, `meet-sync off`, `meet-sync`.
+    MeetSync {
+        /// `on` or `off`; omit to print current value.
         value: Option<String>,
     },
     /// Mute the Quadcast input device via Core Audio (system-wide).
@@ -1051,8 +1239,11 @@ fn config_from_args(
     if delay > 100 {
         bail!("delay must be 0-100");
     }
-    // Preserve on_mute across `set` invocations so the user only has to set it once.
-    let existing_on_mute = load_config().ok().and_then(|c| c.on_mute);
+    // Preserve on_mute and meet_sync across `set` invocations so the user
+    // only has to set them once.
+    let existing = load_config().ok();
+    let existing_on_mute = existing.as_ref().and_then(|c| c.on_mute.clone());
+    let existing_meet_sync = existing.as_ref().map(|c| c.meet_sync).unwrap_or(false);
     Ok(Config {
         mode,
         colors: color_args,
@@ -1061,6 +1252,7 @@ fn config_from_args(
         speed,
         delay,
         on_mute: existing_on_mute,
+        meet_sync: existing_meet_sync,
     })
 }
 
@@ -1188,6 +1380,9 @@ fn cmd_daemon() -> Result<()> {
                     "[quadcastctl] mute -> {}",
                     if muted { "MUTED" } else { "unmuted" }
                 );
+                if cfg.meet_sync {
+                    sync_meet_mute_async(muted);
+                }
             }
         }
 
@@ -1239,6 +1434,91 @@ fn cmd_daemon() -> Result<()> {
     Ok(())
 }
 
+/// Drive Google Meet's in-call mic button to match `target_muted` by running
+/// JS inside any open Chrome tab on meet.google.com.
+///
+/// Runs detached on a background thread so a slow Chrome can never stall the
+/// LED send loop. Failures are logged and swallowed — Chrome may not be
+/// running, the user may not have the JS-from-Apple-Events flag enabled, or
+/// no Meet tab may be open. None of these are daemon-fatal.
+fn sync_meet_mute_async(target_muted: bool) {
+    std::thread::spawn(move || {
+        let target = if target_muted { "true" } else { "false" };
+        // Meet's mic button has aria-label "Turn on microphone (⌘ + d)" when
+        // currently muted, and "Turn off microphone..." when currently
+        // unmuted. We click only when state mismatches our target, so this is
+        // idempotent and safe to fire on every transition.
+        let script = format!(
+            r#"
+tell application "Google Chrome"
+    if not (it is running) then return "no-chrome"
+    set out to ""
+    repeat with w in windows
+        repeat with t in tabs of w
+            try
+                if (URL of t) contains "meet.google.com" then
+                    set r to (execute t javascript "(function(){{var b=document.querySelector('[aria-label*=\"microphone\" i][role=\"button\"],button[aria-label*=\"microphone\" i]');if(!b)return 'no-button';var a=(b.getAttribute('aria-label')||'').toLowerCase();var muted=/turn on/.test(a);if(muted!=={target}){{b.click();return 'clicked';}}return 'in-sync';}})()")
+                    set out to out & r & ";"
+                end if
+            end try
+        end repeat
+    end repeat
+    if out is "" then return "no-meet-tab"
+    return out
+end tell
+"#
+        );
+        match Command::new("osascript").args(["-e", &script]).output() {
+            Ok(out) if out.status.success() => {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                eprintln!("[quadcastctl] meet-sync target={target} result={s}");
+            }
+            Ok(out) => {
+                eprintln!(
+                    "[quadcastctl] meet-sync osascript failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(e) => eprintln!("[quadcastctl] meet-sync spawn failed: {e}"),
+        }
+    });
+}
+
+fn cmd_meet_sync(value: Option<&str>) -> Result<()> {
+    let mut cfg = load_config()?;
+    match value {
+        None => {
+            println!(
+                "meet_sync = {}",
+                if cfg.meet_sync { "on" } else { "off" }
+            );
+        }
+        Some(v) => {
+            let want = match v.to_ascii_lowercase().as_str() {
+                "on" | "true" | "1" | "yes" => true,
+                "off" | "false" | "0" | "no" => false,
+                other => bail!("expected on|off, got {other:?}"),
+            };
+            cfg.meet_sync = want;
+            save_config(&cfg)?;
+            println!("meet_sync = {}", if want { "on" } else { "off" });
+            if want {
+                println!(
+                    "note: enable Chrome > View > Developer > \
+                     'Allow JavaScript from Apple Events' so the daemon can \
+                     drive Meet's mic button without focus-stealing."
+                );
+                println!(
+                    "      triggers on system-level mute (Control Center, \
+                     `quadcastctl mute`, push-to-talk hotkey) — the mic's \
+                     hardware tap is invisible to macOS."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pick_color_macos() -> Result<Color> {
     let script = r#"
         try
@@ -1286,7 +1566,9 @@ fn cmd_pick(brightness: u8) -> Result<()> {
     }
     let color = pick_color_macos()?;
     let hex = format!("{:02x}{:02x}{:02x}", color.r, color.g, color.b);
-    let existing_on_mute = load_config().ok().and_then(|c| c.on_mute);
+    let existing = load_config().ok();
+    let existing_on_mute = existing.as_ref().and_then(|c| c.on_mute.clone());
+    let existing_meet_sync = existing.as_ref().map(|c| c.meet_sync).unwrap_or(false);
     let cfg = Config {
         mode: Mode::Solid,
         colors: vec![hex.clone()],
@@ -1295,6 +1577,7 @@ fn cmd_pick(brightness: u8) -> Result<()> {
         speed: 81,
         delay: 10,
         on_mute: existing_on_mute,
+        meet_sync: existing_meet_sync,
     };
     save_config(&cfg)?;
     println!("picked #{hex} (brightness {brightness}) — daemon picks up within ~1s");
@@ -1513,7 +1796,9 @@ fn main() -> Result<()> {
         Cmd::Restart => cmd_restart(),
         Cmd::Status => cmd_status(),
         Cmd::AudioState => cmd_audio_state(),
+        Cmd::AudioDebug => cmd_audio_debug(),
         Cmd::MuteColor { value } => cmd_mute_color(value.as_deref()),
+        Cmd::MeetSync { value } => cmd_meet_sync(value.as_deref()),
         Cmd::Mute => cmd_set_mute(true),
         Cmd::Unmute => cmd_set_mute(false),
         Cmd::MuteToggle => cmd_mute_toggle(),
