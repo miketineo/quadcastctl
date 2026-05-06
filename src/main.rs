@@ -1177,6 +1177,20 @@ fn cmd_daemon() -> Result<()> {
     }
     let mut idx = 0usize;
     while running.load(Ordering::SeqCst) {
+        // Poll mute state every iteration so unmute transitions are imperceptible.
+        // ca_read_input_mute is a single AudioObjectGetPropertyData call (~µs).
+        if let Some((id, _)) = &quadcast_audio {
+            let now_mute = ca_read_input_mute(*id).ok().flatten().unwrap_or(false);
+            if now_mute != muted {
+                muted = now_mute;
+                idx = 0;
+                eprintln!(
+                    "[quadcastctl] mute -> {}",
+                    if muted { "MUTED" } else { "unmuted" }
+                );
+            }
+        }
+
         let active_frames = if muted && mute_frames.is_some() {
             mute_frames.as_ref().unwrap()
         } else {
@@ -1194,18 +1208,6 @@ fn cmd_daemon() -> Result<()> {
             .unwrap_or(true)
         {
             last_poll = SystemTime::now();
-            // Mute state poll
-            if let Some((id, _)) = &quadcast_audio {
-                let now_mute = ca_read_input_mute(*id).ok().flatten().unwrap_or(false);
-                if now_mute != muted {
-                    muted = now_mute;
-                    idx = 0;
-                    eprintln!(
-                        "[quadcastctl] mute -> {}",
-                        if muted { "MUTED" } else { "unmuted" }
-                    );
-                }
-            }
             // Config-file mtime poll
             let now_mtime = config_mtime();
             if now_mtime != last_mtime {
