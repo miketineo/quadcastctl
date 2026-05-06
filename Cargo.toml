@@ -1,6 +1,6 @@
 [package]
 name = "quadcastctl"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Control HyperX Quadcast S / Quadcast 2 / Quadcast 2S / Duocast RGB lighting"
 license = "GPL-2.0-only"
