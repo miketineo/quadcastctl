@@ -30,6 +30,23 @@ const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 const LAUNCHD_LABEL: &str = "com.miketineo.quadcastctl";
 
+// Mode timing constants — matched to upstream rgbmodes.h so the visual feel
+// is the same as the C tool / NGenuity.
+const MIN_CYCL_TR: u32 = 12;
+const MAX_CYCL_TR: u32 = 128;
+const MIN_LGHT_BL: u32 = 1;
+const MAX_LGHT_BL: u32 = 9;
+const MIN_LGHT_UP: u32 = 3;
+const MAX_LGHT_UP: u32 = 10;
+const MIN_LGHT_DOWN: u32 = 21;
+const MAX_LGHT_DOWN: u32 = 131;
+
+// SPEED_RANGE(MIN, MAX, SPD) = MIN + (MAX-MIN)*(100-SPD)/100  (slower at lower spd)
+fn speed_range(min: u32, max: u32, spd: u8) -> u32 {
+    let spd = spd.min(100) as u32;
+    min + (max - min) * (100 - spd) / 100
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Model {
     QuadcastS,
@@ -63,12 +80,14 @@ impl Model {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Color {
     r: u8,
     g: u8,
     b: u8,
 }
+
+const BLACK: Color = Color { r: 0, g: 0, b: 0 };
 
 impl Color {
     fn from_hex(s: &str) -> Result<Self> {
@@ -94,96 +113,47 @@ impl Color {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Config {
-    /// Hex color for the upper diode (no '#').
-    color: String,
-    /// Brightness 0-100.
-    #[serde(default = "default_brightness")]
-    brightness: u8,
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let lerp = |x: u8, y: u8| {
+        let v = x as f32 + (y as f32 - x as f32) * t;
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    Color {
+        r: lerp(a.r, b.r),
+        g: lerp(a.g, b.g),
+        b: lerp(a.b, b.b),
+    }
 }
 
-fn default_brightness() -> u8 {
-    100
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Mode {
+    Solid,
+    Blink,
+    Cycle,
+    Wave,
+    Pulse,
+    Lightning,
 }
 
-impl Default for Config {
+impl Default for Mode {
     fn default() -> Self {
-        Self {
-            color: "ff9a33".into(),
-            brightness: 100,
-        }
+        Mode::Solid
     }
 }
 
-impl Config {
-    fn resolved(&self) -> Result<Color> {
-        if self.brightness > 100 {
-            bail!("brightness must be 0-100");
+impl Mode {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "solid" => Some(Mode::Solid),
+            "blink" => Some(Mode::Blink),
+            "cycle" => Some(Mode::Cycle),
+            "wave" => Some(Mode::Wave),
+            "pulse" => Some(Mode::Pulse),
+            "lightning" => Some(Mode::Lightning),
+            _ => None,
         }
-        Ok(Color::from_hex(&self.color)?.scaled(self.brightness))
     }
-}
-
-#[derive(Parser)]
-#[command(name = "quadcastctl", version, about)]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(Subcommand)]
-enum PresetCmd {
-    /// List built-in and user-defined presets.
-    List,
-    /// Add or override a preset.
-    Add { name: String, color: String },
-    /// Remove a user preset (built-ins cannot be removed, only overridden).
-    Remove { name: String },
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// List connected HyperX microphones.
-    List,
-    /// Run a foreground solid-color loop. Ctrl-C to exit. Bypasses the config file.
-    Solid {
-        color: String,
-        #[arg(short, long, default_value_t = 100)]
-        brightness: u8,
-    },
-    /// Update the persisted config. Daemon picks up changes within ~1s.
-    Set {
-        color: String,
-        #[arg(short, long, default_value_t = 100)]
-        brightness: u8,
-    },
-    /// Open the macOS system color picker; chosen color becomes the new setting.
-    Pick {
-        #[arg(short, long, default_value_t = 100)]
-        brightness: u8,
-    },
-    /// Manage named color presets.
-    Preset {
-        #[command(subcommand)]
-        action: PresetCmd,
-    },
-    /// Print the current config file contents.
-    Show,
-    /// Run as daemon: read config, drive lights, hot-reload on config change.
-    Daemon,
-    /// Install launchd LaunchAgent so the daemon auto-starts at login.
-    Install,
-    /// Remove the launchd LaunchAgent.
-    Uninstall,
-    /// Start the launchd-managed daemon.
-    Start,
-    /// Stop the launchd-managed daemon.
-    Stop,
-    /// Restart the launchd-managed daemon.
-    Restart,
-    /// Show launchd job status.
-    Status,
 }
 
 const BUILTIN_PRESETS: &[(&str, &str)] = &[
@@ -200,7 +170,6 @@ const BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("off", "000000"),
     ("hivenet", "ff9a33"),
 ];
-
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct UserPresets {
     #[serde(default)]
@@ -246,9 +215,7 @@ fn resolve_color_or_preset(input: &str) -> Result<String> {
             return Ok((*hex).to_string());
         }
     }
-    bail!(
-        "{input:?} is not a valid hex color or known preset. Try `quadcastctl preset list`."
-    )
+    bail!("{input:?} is not a valid hex color or known preset. Try `quadcastctl preset list`.")
 }
 
 fn config_dir() -> Result<PathBuf> {
@@ -258,6 +225,78 @@ fn config_dir() -> Result<PathBuf> {
 
 fn config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Config {
+    #[serde(default)]
+    mode: Mode,
+    #[serde(default)]
+    colors: Vec<String>,
+    /// Legacy single-color field; used when `colors` is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+    #[serde(default = "default_brightness")]
+    brightness: u8,
+    #[serde(default = "default_speed")]
+    speed: u8,
+    #[serde(default = "default_delay")]
+    delay: u8,
+}
+
+fn default_brightness() -> u8 {
+    100
+}
+fn default_speed() -> u8 {
+    81
+}
+fn default_delay() -> u8 {
+    10
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Solid,
+            colors: vec!["ff9a33".into()],
+            color: None,
+            brightness: 100,
+            speed: 81,
+            delay: 10,
+        }
+    }
+}
+
+impl Config {
+    fn effective_colors(&self) -> Vec<String> {
+        if !self.colors.is_empty() {
+            self.colors.clone()
+        } else if let Some(c) = &self.color {
+            vec![c.clone()]
+        } else {
+            vec!["ff9a33".into()]
+        }
+    }
+
+    fn resolved_colors(&self) -> Result<Vec<Color>> {
+        if self.brightness > 100 {
+            bail!("brightness must be 0-100");
+        }
+        let mut out = Vec::new();
+        for c in self.effective_colors() {
+            let hex = resolve_color_or_preset(&c)?;
+            out.push(Color::from_hex(&hex)?.scaled(self.brightness));
+        }
+        Ok(out)
+    }
+
+    fn summary(&self) -> String {
+        let colors = self.effective_colors().join(",");
+        format!(
+            "{:?} colors=[{}] brightness={} speed={} delay={}",
+            self.mode, colors, self.brightness, self.speed, self.delay
+        )
+    }
 }
 
 fn load_config() -> Result<Config> {
@@ -282,6 +321,163 @@ fn config_mtime() -> Option<SystemTime> {
     let path = config_path().ok()?;
     fs::metadata(&path).and_then(|m| m.modified()).ok()
 }
+
+// --- Frame generation -------------------------------------------------------
+
+type Frame = [u8; 8];
+
+fn frame_pair(upper: Color, lower: Color) -> Frame {
+    [
+        RGB_CODE, upper.r, upper.g, upper.b, RGB_CODE, lower.r, lower.g, lower.b,
+    ]
+}
+
+fn zip_frames(upper: &[Color], lower: &[Color]) -> Vec<Frame> {
+    if upper.is_empty() && lower.is_empty() {
+        return vec![frame_pair(BLACK, BLACK)];
+    }
+    let len = upper.len().max(lower.len());
+    let pick = |seq: &[Color], i: usize| -> Color {
+        if seq.is_empty() {
+            BLACK
+        } else {
+            seq[i % seq.len()]
+        }
+    };
+    (0..len)
+        .map(|i| frame_pair(pick(upper, i), pick(lower, i)))
+        .collect()
+}
+
+fn gen_solid(colors: &[Color]) -> Vec<Color> {
+    vec![*colors.first().unwrap_or(&BLACK)]
+}
+
+fn gen_cycle(colors: &[Color], speed: u8) -> Vec<Color> {
+    if colors.is_empty() {
+        return vec![BLACK];
+    }
+    if colors.len() == 1 {
+        return colors.to_vec();
+    }
+    let tr_len = speed_range(MIN_CYCL_TR, MAX_CYCL_TR, speed) as usize;
+    let mut out = Vec::with_capacity(colors.len() * tr_len);
+    for i in 0..colors.len() {
+        let start = colors[i];
+        let end = colors[(i + 1) % colors.len()];
+        for k in 0..tr_len {
+            let t = k as f32 / tr_len as f32;
+            out.push(lerp_color(start, end, t));
+        }
+    }
+    out
+}
+
+fn gen_blink(colors: &[Color], speed: u8, delay: u8) -> Vec<Color> {
+    if colors.is_empty() {
+        return vec![BLACK];
+    }
+    let on = (101u32.saturating_sub(speed as u32)) as usize;
+    let off = delay as usize;
+    let mut out = Vec::new();
+    for c in colors {
+        for _ in 0..on {
+            out.push(*c);
+        }
+        for _ in 0..off {
+            out.push(BLACK);
+        }
+    }
+    if out.is_empty() {
+        out.push(*colors.first().unwrap_or(&BLACK));
+    }
+    out
+}
+
+/// Pulse / lightning shared shape: per color, do a [black-hold, fade-up, fade-down].
+/// `synchronous=true` → both diodes do the same thing at the same time (pulse).
+/// `synchronous=false` → upper holds black during lower's fade and vice versa (lightning).
+fn gen_lightning_one(colors: &[Color], speed: u8, synchronous: bool, is_lower: bool) -> Vec<Color> {
+    if colors.is_empty() {
+        return vec![BLACK];
+    }
+    let bl = speed_range(MIN_LGHT_BL, MAX_LGHT_BL, speed) as usize;
+    let up = speed_range(MIN_LGHT_UP, MAX_LGHT_UP, speed) as usize;
+    let down = speed_range(MIN_LGHT_DOWN, MAX_LGHT_DOWN, speed) as usize;
+    let mut out = Vec::new();
+    for c in colors {
+        // Lower channel pre-pause when async (waits while upper finishes its prior pulse)
+        if is_lower && !synchronous {
+            for _ in 0..bl {
+                out.push(BLACK);
+            }
+        }
+        // fade up
+        for k in 1..=up {
+            let t = k as f32 / up.max(1) as f32;
+            out.push(lerp_color(BLACK, *c, t));
+        }
+        // fade down
+        for k in 1..=down {
+            let t = k as f32 / down.max(1) as f32;
+            out.push(lerp_color(*c, BLACK, t));
+        }
+        // Upper or both finish with hold-black
+        if synchronous || !is_lower {
+            for _ in 0..bl {
+                out.push(BLACK);
+            }
+        }
+    }
+    out
+}
+
+fn shifted<T: Clone>(v: &[T]) -> Vec<T> {
+    if v.len() <= 1 {
+        return v.to_vec();
+    }
+    let mut out: Vec<T> = v[1..].to_vec();
+    out.push(v[0].clone());
+    out
+}
+
+fn generate_frames(cfg: &Config) -> Result<Vec<Frame>> {
+    let colors = cfg.resolved_colors()?;
+    let frames = match cfg.mode {
+        Mode::Solid => {
+            let seq = gen_solid(&colors);
+            zip_frames(&seq, &seq)
+        }
+        Mode::Blink => {
+            let seq = gen_blink(&colors, cfg.speed, cfg.delay);
+            zip_frames(&seq, &seq)
+        }
+        Mode::Cycle => {
+            let seq = gen_cycle(&colors, cfg.speed);
+            zip_frames(&seq, &seq)
+        }
+        Mode::Wave => {
+            let upper = gen_cycle(&colors, cfg.speed);
+            let lower = gen_cycle(&shifted(&colors), cfg.speed);
+            zip_frames(&upper, &lower)
+        }
+        Mode::Pulse => {
+            let seq = gen_lightning_one(&colors, cfg.speed, true, false);
+            zip_frames(&seq, &seq)
+        }
+        Mode::Lightning => {
+            let upper = gen_lightning_one(&colors, cfg.speed, false, false);
+            let lower = gen_lightning_one(&colors, cfg.speed, false, true);
+            zip_frames(&upper, &lower)
+        }
+    };
+    if frames.is_empty() {
+        return Ok(vec![frame_pair(BLACK, BLACK)]);
+    }
+    Ok(frames)
+}
+
+// --- USB / device -----------------------------------------------------------
 
 fn find_mic() -> Result<(Device<GlobalContext>, Model)> {
     for dev in rusb::devices().context("listing USB devices")?.iter() {
@@ -319,16 +515,9 @@ fn build_header_packet() -> [u8; PACKET_SIZE] {
     p
 }
 
-fn build_solid_packet(upper: Color, lower: Color) -> [u8; PACKET_SIZE] {
+fn build_data_packet(frame: &Frame) -> [u8; PACKET_SIZE] {
     let mut p = [0u8; PACKET_SIZE];
-    p[0] = RGB_CODE;
-    p[1] = upper.r;
-    p[2] = upper.g;
-    p[3] = upper.b;
-    p[4] = RGB_CODE;
-    p[5] = lower.r;
-    p[6] = lower.g;
-    p[7] = lower.b;
+    p[..8].copy_from_slice(frame);
     p
 }
 
@@ -357,25 +546,129 @@ fn install_signal_handler() -> Result<Arc<AtomicBool>> {
     Ok(running)
 }
 
-fn drive_lights(
-    handle: &DeviceHandle<GlobalContext>,
-    color: Color,
-    running: &AtomicBool,
-    deadline: Option<SystemTime>,
-) -> Result<()> {
-    let header = build_header_packet();
-    let data = build_solid_packet(color, color);
-    while running.load(Ordering::SeqCst) {
-        if let Some(d) = deadline {
-            if SystemTime::now() >= d {
-                return Ok(());
-            }
+// --- Commands ---------------------------------------------------------------
+
+#[derive(Parser)]
+#[command(name = "quadcastctl", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum PresetCmd {
+    /// List built-in and user-defined presets.
+    List,
+    /// Add or override a preset.
+    Add { name: String, color: String },
+    /// Remove a user preset.
+    Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// List connected HyperX microphones.
+    List,
+    /// Update the persisted config. Daemon picks up changes within ~1s.
+    /// Examples: `set red` (solid), `set cycle red green blue`, `set pulse hivenet`.
+    Set {
+        /// Either a color/preset (sets solid mode) or one of: solid, blink, cycle, wave, pulse, lightning.
+        first: String,
+        /// Additional colors for non-solid modes.
+        colors: Vec<String>,
+        #[arg(short, long, default_value_t = 100)]
+        brightness: u8,
+        #[arg(short, long, default_value_t = 81)]
+        speed: u8,
+        #[arg(short, long, default_value_t = 10)]
+        delay: u8,
+    },
+    /// Run a foreground loop using the given args (same syntax as `set`). Ctrl-C to stop.
+    Solid {
+        first: String,
+        colors: Vec<String>,
+        #[arg(short, long, default_value_t = 100)]
+        brightness: u8,
+        #[arg(short, long, default_value_t = 81)]
+        speed: u8,
+        #[arg(short, long, default_value_t = 10)]
+        delay: u8,
+    },
+    /// Print the current config file contents.
+    Show,
+    /// Open the macOS system color picker; chosen color becomes a solid setting.
+    Pick {
+        #[arg(short, long, default_value_t = 100)]
+        brightness: u8,
+    },
+    /// Manage named color presets.
+    Preset {
+        #[command(subcommand)]
+        action: PresetCmd,
+    },
+    /// Run as daemon: read config, drive lights, hot-reload on config change.
+    Daemon,
+    /// Install launchd LaunchAgent.
+    Install,
+    /// Remove the launchd LaunchAgent.
+    Uninstall,
+    /// Start the launchd-managed daemon.
+    Start,
+    /// Stop the launchd-managed daemon.
+    Stop,
+    /// Restart the launchd-managed daemon.
+    Restart,
+    /// Show launchd job status.
+    Status,
+}
+
+/// Build a Config from CLI args. If `first` is a mode name, it's the mode and
+/// `colors` are the colors. Otherwise `first` is treated as the (only) color
+/// in solid mode.
+fn config_from_args(
+    first: &str,
+    colors: &[String],
+    brightness: u8,
+    speed: u8,
+    delay: u8,
+) -> Result<Config> {
+    let (mode, color_args) = if let Some(m) = Mode::parse(first) {
+        (m, colors.to_vec())
+    } else {
+        if !colors.is_empty() {
+            bail!(
+                "extra colors given but first arg {first:?} is not a mode. \
+                 Use a mode name (solid, blink, cycle, wave, pulse, lightning) \
+                 to pass multiple colors."
+            );
         }
-        send_control_packet(handle, &header)?;
-        send_control_packet(handle, &data)?;
-        std::thread::sleep(REFRESH_INTERVAL);
+        (Mode::Solid, vec![first.to_string()])
+    };
+    if color_args.is_empty() {
+        bail!("at least one color required");
     }
-    Ok(())
+    // Validate every color resolves now so the daemon doesn't fail on reload.
+    for c in &color_args {
+        let hex = resolve_color_or_preset(c)?;
+        Color::from_hex(&hex)?;
+    }
+    if brightness > 100 {
+        bail!("brightness must be 0-100");
+    }
+    if speed > 100 {
+        bail!("speed must be 0-100");
+    }
+    if delay > 100 {
+        bail!("delay must be 0-100");
+    }
+    Ok(Config {
+        mode,
+        colors: color_args,
+        color: None,
+        brightness,
+        speed,
+        delay,
+    })
 }
 
 fn cmd_list() -> Result<()> {
@@ -392,33 +685,125 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-fn cmd_solid(color: &str, brightness: u8) -> Result<()> {
-    let hex = resolve_color_or_preset(color)?;
-    let cfg = Config {
-        color: hex,
-        brightness,
-    };
-    let color = cfg.resolved()?;
+fn cmd_set(
+    first: &str,
+    colors: &[String],
+    brightness: u8,
+    speed: u8,
+    delay: u8,
+) -> Result<()> {
+    let cfg = config_from_args(first, colors, brightness, speed, delay)?;
+    save_config(&cfg)?;
+    println!("wrote {} ({})", config_path()?.display(), cfg.summary());
+    Ok(())
+}
+
+fn cmd_solid_foreground(
+    first: &str,
+    colors: &[String],
+    brightness: u8,
+    speed: u8,
+    delay: u8,
+) -> Result<()> {
+    let cfg = config_from_args(first, colors, brightness, speed, delay)?;
+    let frames = generate_frames(&cfg)?;
     let (handle, model) = open_mic()?;
     if matches!(model, Model::Quadcast2S) {
         bail!("Quadcast 2S uses a different protocol — not implemented yet");
     }
     eprintln!(
-        "Driving {} with solid #{:02x}{:02x}{:02x}. Ctrl-C to stop.",
+        "Driving {} with {} ({} frames). Ctrl-C to stop.",
         model.name(),
-        color.r,
-        color.g,
-        color.b
+        cfg.summary(),
+        frames.len()
     );
     let running = install_signal_handler()?;
-    drive_lights(&handle, color, &running, None)?;
+    let header = build_header_packet();
+    let mut idx = 0usize;
+    while running.load(Ordering::SeqCst) {
+        let packet = build_data_packet(&frames[idx % frames.len()]);
+        send_control_packet(&handle, &header)?;
+        send_control_packet(&handle, &packet)?;
+        std::thread::sleep(REFRESH_INTERVAL);
+        idx = idx.wrapping_add(1);
+    }
     eprintln!("Stopped.");
     Ok(())
 }
 
+fn cmd_show() -> Result<()> {
+    let path = config_path()?;
+    if !path.exists() {
+        println!("no config at {} (using defaults)", path.display());
+        let cfg = Config::default();
+        println!("{}", toml::to_string_pretty(&cfg)?);
+        return Ok(());
+    }
+    let text = fs::read_to_string(&path)?;
+    println!("{}:\n{}", path.display(), text);
+    Ok(())
+}
+
+fn cmd_daemon() -> Result<()> {
+    let (handle, model) = open_mic()?;
+    if matches!(model, Model::Quadcast2S) {
+        bail!("Quadcast 2S uses a different protocol — not implemented yet");
+    }
+    let running = install_signal_handler()?;
+    let mut cfg = load_config()?;
+    let mut frames = generate_frames(&cfg)?;
+    let mut last_mtime = config_mtime();
+    let mut last_poll = SystemTime::now();
+    let header = build_header_packet();
+    eprintln!(
+        "[quadcastctl] daemon driving {} with {} ({} frames)",
+        model.name(),
+        cfg.summary(),
+        frames.len()
+    );
+    let mut idx = 0usize;
+    while running.load(Ordering::SeqCst) {
+        let packet = build_data_packet(&frames[idx % frames.len()]);
+        send_control_packet(&handle, &header)?;
+        send_control_packet(&handle, &packet)?;
+        std::thread::sleep(REFRESH_INTERVAL);
+        idx = idx.wrapping_add(1);
+
+        if last_poll
+            .elapsed()
+            .map(|e| e >= CONFIG_POLL_INTERVAL)
+            .unwrap_or(true)
+        {
+            last_poll = SystemTime::now();
+            let now_mtime = config_mtime();
+            if now_mtime != last_mtime {
+                last_mtime = now_mtime;
+                match load_config().and_then(|c| {
+                    let f = generate_frames(&c)?;
+                    Ok((c, f))
+                }) {
+                    Ok((new_cfg, new_frames)) => {
+                        cfg = new_cfg;
+                        frames = new_frames;
+                        idx = 0;
+                        eprintln!(
+                            "[quadcastctl] reloaded: {} ({} frames)",
+                            cfg.summary(),
+                            frames.len()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[quadcastctl] config reload failed, keeping previous: {e:#}");
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("[quadcastctl] daemon exiting cleanly");
+    Ok(())
+}
+
 fn pick_color_macos() -> Result<Color> {
-    // AppleScript's `choose color` returns {R, G, B} in the 0..65535 range.
-    // We capture stdout, parse the three integers, and downscale to u8.
     let script = r#"
         try
             set c to choose color
@@ -450,7 +835,6 @@ fn pick_color_macos() -> Result<Color> {
     }
     let parse = |p: &str| -> Result<u8> {
         let n: u32 = p.trim().parse().context("parsing color component")?;
-        // AppleScript color range is 0..65535; map to 0..255.
         Ok((n / 257).min(255) as u8)
     };
     Ok(Color {
@@ -467,30 +851,15 @@ fn cmd_pick(brightness: u8) -> Result<()> {
     let color = pick_color_macos()?;
     let hex = format!("{:02x}{:02x}{:02x}", color.r, color.g, color.b);
     let cfg = Config {
-        color: hex.clone(),
+        mode: Mode::Solid,
+        colors: vec![hex.clone()],
+        color: None,
         brightness,
+        speed: 81,
+        delay: 10,
     };
     save_config(&cfg)?;
-    println!(
-        "picked #{hex} (brightness {brightness}) — daemon picks up within ~1s"
-    );
-    Ok(())
-}
-
-fn cmd_set(color: &str, brightness: u8) -> Result<()> {
-    let hex = resolve_color_or_preset(color)?;
-    let cfg = Config {
-        color: hex,
-        brightness,
-    };
-    cfg.resolved()?; // validate before saving
-    save_config(&cfg)?;
-    println!(
-        "wrote {} (color={}, brightness={})",
-        config_path()?.display(),
-        cfg.color,
-        cfg.brightness
-    );
+    println!("picked #{hex} (brightness {brightness}) — daemon picks up within ~1s");
     Ok(())
 }
 
@@ -532,89 +901,22 @@ fn cmd_preset_remove(name: &str) -> Result<()> {
         save_user_presets(&user)?;
         println!("removed user preset {name}");
     } else if BUILTIN_PRESETS.iter().any(|(n, _)| *n == name) {
-        bail!("{name:?} is a built-in preset; built-ins cannot be removed (override with `preset add`)");
+        bail!(
+            "{name:?} is a built-in preset; built-ins cannot be removed (override with `preset add`)"
+        );
     } else {
         bail!("no preset named {name:?}");
     }
     Ok(())
 }
 
-fn cmd_show() -> Result<()> {
-    let path = config_path()?;
-    if !path.exists() {
-        println!("no config at {} (using defaults)", path.display());
-        let cfg = Config::default();
-        println!("{}", toml::to_string_pretty(&cfg)?);
-        return Ok(());
-    }
-    let text = fs::read_to_string(&path)?;
-    println!("{}:\n{}", path.display(), text);
-    Ok(())
-}
-
-fn cmd_daemon() -> Result<()> {
-    let (handle, model) = open_mic()?;
-    if matches!(model, Model::Quadcast2S) {
-        bail!("Quadcast 2S uses a different protocol — not implemented yet");
-    }
-    let running = install_signal_handler()?;
-
-    let mut cfg = load_config()?;
-    let mut color = cfg.resolved()?;
-    let mut last_mtime = config_mtime();
-    let mut last_poll = SystemTime::now();
-    let header = build_header_packet();
-    let mut data = build_solid_packet(color, color);
-
-    eprintln!(
-        "[quadcastctl] daemon driving {} with #{:02x}{:02x}{:02x}",
-        model.name(),
-        color.r,
-        color.g,
-        color.b
-    );
-
-    while running.load(Ordering::SeqCst) {
-        send_control_packet(&handle, &header)?;
-        send_control_packet(&handle, &data)?;
-        std::thread::sleep(REFRESH_INTERVAL);
-
-        if last_poll
-            .elapsed()
-            .map(|e| e >= CONFIG_POLL_INTERVAL)
-            .unwrap_or(true)
-        {
-            last_poll = SystemTime::now();
-            let now_mtime = config_mtime();
-            if now_mtime != last_mtime {
-                last_mtime = now_mtime;
-                match load_config().and_then(|c| {
-                    let col = c.resolved()?;
-                    Ok((c, col))
-                }) {
-                    Ok((new_cfg, new_color)) => {
-                        cfg = new_cfg;
-                        color = new_color;
-                        data = build_solid_packet(color, color);
-                        eprintln!(
-                            "[quadcastctl] reloaded config: color={} brightness={} -> #{:02x}{:02x}{:02x}",
-                            cfg.color, cfg.brightness, color.r, color.g, color.b
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[quadcastctl] config reload failed, keeping previous: {e:#}");
-                    }
-                }
-            }
-        }
-    }
-    eprintln!("[quadcastctl] daemon exiting cleanly");
-    Ok(())
-}
+// --- launchd ----------------------------------------------------------------
 
 fn launchd_plist_path() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
-    Ok(home.join("Library/LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist")))
+    Ok(home
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
 fn launchd_log_dir() -> Result<PathBuf> {
@@ -690,7 +992,6 @@ fn cmd_install() -> Result<()> {
         .with_context(|| format!("writing {}", plist_path.display()))?;
     println!("wrote {}", plist_path.display());
 
-    // Best-effort bootstrap; ignore failure if already loaded.
     let domain = launchctl_domain();
     let _ = Command::new("launchctl")
         .args(["bootout", &launchctl_target()])
@@ -745,15 +1046,27 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::List => cmd_list(),
-        Cmd::Solid { color, brightness } => cmd_solid(&color, brightness),
-        Cmd::Set { color, brightness } => cmd_set(&color, brightness),
+        Cmd::Set {
+            first,
+            colors,
+            brightness,
+            speed,
+            delay,
+        } => cmd_set(&first, &colors, brightness, speed, delay),
+        Cmd::Solid {
+            first,
+            colors,
+            brightness,
+            speed,
+            delay,
+        } => cmd_solid_foreground(&first, &colors, brightness, speed, delay),
+        Cmd::Show => cmd_show(),
         Cmd::Pick { brightness } => cmd_pick(brightness),
         Cmd::Preset { action } => match action {
             PresetCmd::List => cmd_preset_list(),
             PresetCmd::Add { name, color } => cmd_preset_add(&name, &color),
             PresetCmd::Remove { name } => cmd_preset_remove(&name),
         },
-        Cmd::Show => cmd_show(),
         Cmd::Daemon => cmd_daemon(),
         Cmd::Install => cmd_install(),
         Cmd::Uninstall => cmd_uninstall(),
